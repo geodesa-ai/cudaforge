@@ -18,6 +18,7 @@ ci-check = []
 
 [dependencies]
 glob = "0.3.1"
+jobserver = "0.1.35"
 num_cpus = "1.16.0"
 rayon = "1.10.0"
 which = "7.0.0"

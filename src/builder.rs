@@ -8,6 +8,7 @@ use crate::parallel::ParallelConfig;
 use crate::source::SourceSelector;
 use crate::toolkit::CudaToolkit;
 
+use crate::jobserver::JobTokens;
 use rayon::prelude::*;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -401,6 +402,8 @@ impl KernelBuilder {
                 if had_error.load(Ordering::Relaxed) {
                     return Ok(());
                 }
+                let jobs = JobTokens::get();
+                let _job = jobs.acquire()?;
 
                 let gencode_arg = gpu_arch.to_gencode_arg();
 
@@ -442,9 +445,17 @@ impl KernelBuilder {
                 }
 
                 // Add nvcc threads for certain files
+                // Under a jobserver, extra nvcc threads take extra tokens.
+                let mut _extra_jobs = Vec::new();
                 if let Some(threads) = nvcc_threads {
                     let filename = kernel_file.to_string_lossy();
                     if self.parallel.should_use_nvcc_threads(&filename) {
+                        let threads = if jobs.is_active() {
+                            _extra_jobs = jobs.try_acquire_extra(threads.saturating_sub(1));
+                            1 + _extra_jobs.len()
+                        } else {
+                            threads
+                        };
                         command.arg(format!("--threads={}", threads));
                     }
                 }
@@ -598,6 +609,8 @@ impl KernelBuilder {
         // Compile in parallel
         compile_jobs.par_iter().try_for_each(
             |(kernel_file, _output_file, gpu_arch)| -> Result<()> {
+                let jobs = JobTokens::get();
+                let _job = jobs.acquire()?;
                 let gencode_arg = gpu_arch.to_gencode_arg();
 
                 let mut command = Command::new(&toolkit.nvcc_path);
@@ -620,9 +633,17 @@ impl KernelBuilder {
                 }
 
                 // Add nvcc threads for certain files
+                // Under a jobserver, extra nvcc threads take extra tokens.
+                let mut _extra_jobs = Vec::new();
                 if let Some(threads) = nvcc_threads {
                     let file_path = kernel_file.to_string_lossy();
                     if self.parallel.should_use_nvcc_threads(&file_path) {
+                        let threads = if jobs.is_active() {
+                            _extra_jobs = jobs.try_acquire_extra(threads.saturating_sub(1));
+                            1 + _extra_jobs.len()
+                        } else {
+                            threads
+                        };
                         command.arg(format!("--threads={}", threads));
                     }
                 }

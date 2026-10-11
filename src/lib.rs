@@ -87,6 +87,7 @@ mod compute_cap;
 mod dependency;
 mod error;
 mod hash;
+mod jobserver;
 mod parallel;
 mod source;
 mod toolkit;

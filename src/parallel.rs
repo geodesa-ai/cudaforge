@@ -117,14 +117,21 @@ impl ParallelConfig {
             }
         }
 
+        let available = self.detect_available_threads();
+
+        // Under cargo's jobserver every nvcc job holds a token, so the pool
+        // only needs enough threads to use every token: the jobserver, not
+        // a percentage of the machine, bounds concurrency.
+        if crate::jobserver::JobTokens::get().is_active() {
+            return self.max_threads.unwrap_or(available).clamp(1, available);
+        }
+
         // Also check RAYON_NUM_THREADS for compatibility
         if let Ok(env_threads) = std::env::var("RAYON_NUM_THREADS") {
             if let Ok(n) = usize::from_str(&env_threads) {
                 return n.max(1);
             }
         }
-
-        let available = self.detect_available_threads();
 
         let calculated = if let Some(max) = self.max_threads {
             max.min(available)
