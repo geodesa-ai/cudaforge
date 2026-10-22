@@ -85,6 +85,7 @@
 mod builder;
 mod compute_cap;
 mod dependency;
+mod deps;
 mod error;
 mod hash;
 mod parallel;
@@ -96,7 +97,7 @@ pub use builder::{KernelBuilder, PtxOutput};
 pub use compute_cap::{detect_compute_cap, get_gpu_arch_string, ComputeCapability, GpuArch};
 pub use dependency::{resolve_cutlass_from_cargo_checkouts, DependencyManager, ExternalDependency};
 pub use error::{Error, Result};
-pub use hash::BuildCache;
+pub use hash::{BuildCache, DepHash, HashMemo};
 pub use parallel::ParallelConfig;
 pub use source::{collect_headers, SourceSelector};
 pub use toolkit::CudaToolkit;

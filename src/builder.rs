@@ -2,19 +2,23 @@
 
 use crate::compute_cap::{ComputeCapability, GpuArch};
 use crate::dependency::DependencyManager;
+use crate::deps;
 use crate::error::{Error, Result};
-use crate::hash::{hash_args, hash_paths, BuildCache};
+use crate::hash::{hash_args, hash_paths, BuildCache, DepHash, HashMemo};
 use crate::parallel::ParallelConfig;
 use crate::source::SourceSelector;
 use crate::toolkit::CudaToolkit;
 
 use rayon::prelude::*;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
+use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 /// Main builder for CUDA kernel compilation
 #[derive(Debug)]
@@ -402,6 +406,12 @@ impl KernelBuilder {
         // Calculate watch hash for cache
         let watch_hash = hash_paths(self.sources.watch_paths());
 
+        // Dependency closures (see `deps`): recorded per object, checked by `needs_rebuild_memo`,
+        // and emitted as `rerun-if-changed` so that a header edit reruns this build script.
+        let memo = HashMemo::default();
+        let excluded = deps::output_dirs(&self.out_dir);
+        let mut closures: Vec<DepHash> = Vec::new();
+
         // Determine which files need compilation
         let mut compile_jobs: Vec<(PathBuf, PathBuf, GpuArch)> = Vec::new();
         let mut all_obj_files: Vec<PathBuf> = Vec::new();
@@ -418,14 +428,18 @@ impl KernelBuilder {
             all_obj_files.push(obj_file.clone());
 
             if self.incremental
-                && !cache.needs_rebuild(
+                && !cache.needs_rebuild_memo(
                     kernel_file,
                     &obj_file,
                     &gpu_arch.to_nvcc_arch(),
                     &args_hash,
                     &watch_hash,
+                    &memo,
                 )
             {
+                if let Some(d) = cache.deps_of(kernel_file, &obj_file) {
+                    closures.extend_from_slice(d);
+                }
                 continue;
             }
 
@@ -433,6 +447,7 @@ impl KernelBuilder {
         }
 
         if compile_jobs.is_empty() && out_file.exists() {
+            deps::emit_rerun_if_changed(closures.iter().map(|d| d.path.as_str()), &excluded);
             println!("cargo:warning=All library kernels up-to-date, skipping compilation");
             return Ok(());
         }
@@ -447,6 +462,7 @@ impl KernelBuilder {
 
         // Compile in parallel
         let had_error = AtomicBool::new(false);
+        let compiled_deps: Mutex<HashMap<PathBuf, Vec<DepHash>>> = Mutex::new(HashMap::new());
 
         compile_jobs.par_iter().try_for_each(
             |(kernel_file, obj_file, gpu_arch)| -> Result<()> {
@@ -456,54 +472,75 @@ impl KernelBuilder {
 
                 let gencode_arg = gpu_arch.to_gencode_arg();
 
-                let mut command = Command::new(&toolkit.nvcc_path);
-                command
-                    .arg(&gencode_arg)
-                    .arg("-c")
-                    .arg("-o")
-                    .arg(obj_file)
-                    .args(["--default-stream", "per-thread"]);
+                // Everything after the mode and output flags, shared by the compile and its
+                // `nvcc -M` dependency query.
+                let mut rest: Vec<OsString> = vec!["--default-stream".into(), "per-thread".into()];
 
                 // Add extra args
-                for arg in &self.extra_args {
-                    command.arg(arg);
-                }
+                rest.extend(self.extra_args.iter().map(OsString::from));
 
                 // Add dependency includes
-                for arg in &dep_args {
-                    command.arg(arg);
-                }
+                rest.extend(dep_args.iter().map(OsString::from));
 
                 // Add CUTLASS define if using cutlass
                 if self.dependencies.has_cutlass() {
-                    command.arg("-DUSE_CUTLASS");
+                    rest.push("-DUSE_CUTLASS".into());
                 }
 
                 // Add ccbin if set
                 if let Some(ccbin) = &ccbin_env {
-                    command
-                        .arg("-allow-unsupported-compiler")
-                        .args(["-ccbin", ccbin]);
+                    rest.push("-allow-unsupported-compiler".into());
+                    rest.push("-ccbin".into());
+                    rest.push(ccbin.into());
                 }
 
                 // Add PIC flag for non-MSVC
                 if !is_msvc {
-                    command.arg("-Xcompiler").arg("-fPIC");
+                    rest.push("-Xcompiler".into());
+                    rest.push("-fPIC".into());
                 } else {
-                    command.arg("-D_USE_MATH_DEFINES");
+                    rest.push("-D_USE_MATH_DEFINES".into());
                 }
-                crt_args.add_to_command(&mut command);
+                rest.extend(crt_args.cache_args().into_iter().map(OsString::from));
                 if let Some(cudart) = &self.cudart {
-                    command.arg(cudart);
+                    rest.push(cudart.into());
                 }
 
                 // Add nvcc threads for certain files
                 if let Some(threads) = nvcc_threads {
                     let filename = kernel_file.to_string_lossy();
                     if self.parallel.should_use_nvcc_threads(&filename) {
-                        command.arg(format!("--threads={}", threads));
+                        rest.push(format!("--threads={}", threads).into());
                     }
                 }
+
+                // Record what this compile reads, before it runs: if a file changes while nvcc
+                // runs, the recorded hash no longer matches and the next build recompiles.
+                let mut dep_query: Vec<OsString> = vec![gencode_arg.clone().into()];
+                dep_query.extend(rest.iter().cloned());
+                let closure =
+                    match deps::nvcc_closure(&toolkit.nvcc_path, &dep_query, kernel_file) {
+                        Ok(paths) => deps::hash_closure(&paths, &memo).unwrap_or_default(),
+                        Err(e) => {
+                            println!(
+                                "cargo:warning={}: no dependency closure ({e}); it will be rebuilt every time",
+                                kernel_file.display()
+                            );
+                            Vec::new()
+                        }
+                    };
+                compiled_deps
+                    .lock()
+                    .unwrap()
+                    .insert(kernel_file.clone(), closure);
+
+                let mut command = Command::new(&toolkit.nvcc_path);
+                command
+                    .arg(&gencode_arg)
+                    .arg("-c")
+                    .arg("-o")
+                    .arg(obj_file)
+                    .args(&rest);
 
                 command.arg(kernel_file);
 
@@ -532,15 +569,22 @@ impl KernelBuilder {
             },
         )?;
 
+        let mut compiled_deps = compiled_deps.into_inner().unwrap();
+        for d in compiled_deps.values() {
+            closures.extend_from_slice(d);
+        }
+        deps::emit_rerun_if_changed(closures.iter().map(|d| d.path.as_str()), &excluded);
+
         // Update cache for compiled files
         if self.incremental {
             for (kernel_file, obj_file, gpu_arch) in &compile_jobs {
-                cache.update(
+                cache.update_with_deps(
                     kernel_file,
                     obj_file,
                     &gpu_arch.to_nvcc_arch(),
                     &args_hash,
                     &watch_hash,
+                    compiled_deps.remove(kernel_file).unwrap_or_default(),
                 )?;
             }
             cache.save(&self.out_dir)?;
@@ -609,6 +653,10 @@ impl KernelBuilder {
         all_args.extend(dep_args.clone());
         let args_hash = hash_args(&all_args);
 
+        let memo = HashMemo::default();
+        let excluded = deps::output_dirs(&self.out_dir);
+        let mut closures: Vec<DepHash> = Vec::new();
+
         let mut compile_jobs = Vec::new();
         for kernel_file in &kernel_files {
             let filename = kernel_file
@@ -623,14 +671,18 @@ impl KernelBuilder {
 
             // Check if output is current using BuildCache
             if self.incremental
-                && !cache.needs_rebuild(
+                && !cache.needs_rebuild_memo(
                     kernel_file,
                     &output_file,
                     &gpu_arch.to_nvcc_arch(),
                     &args_hash,
                     &watch_hash,
+                    &memo,
                 )
             {
+                if let Some(d) = cache.deps_of(kernel_file, &output_file) {
+                    closures.extend_from_slice(d);
+                }
                 continue;
             }
 
@@ -638,6 +690,7 @@ impl KernelBuilder {
         }
 
         if compile_jobs.is_empty() {
+            deps::emit_rerun_if_changed(closures.iter().map(|d| d.path.as_str()), &excluded);
             println!("cargo:warning=All PTX kernels up-to-date, skipping compilation");
             return Ok(PtxOutput {
                 paths: kernel_files,
@@ -652,36 +705,58 @@ impl KernelBuilder {
         );
 
         // Compile in parallel
+        let compiled_deps: Mutex<HashMap<PathBuf, Vec<DepHash>>> = Mutex::new(HashMap::new());
         compile_jobs.par_iter().try_for_each(
             |(kernel_file, _output_file, gpu_arch)| -> Result<()> {
                 let gencode_arg = gpu_arch.to_gencode_arg();
 
-                let mut command = Command::new(&toolkit.nvcc_path);
-                command
-                    .arg(&gencode_arg)
-                    .arg("--ptx")
-                    .args(["--default-stream", "per-thread"])
-                    .args(["--output-directory", &self.out_dir.to_string_lossy()]);
-
-                for arg in &self.extra_args {
-                    command.arg(arg);
-                }
-                for arg in &dep_args {
-                    command.arg(arg);
-                }
+                // Arguments after the output directory, shared with the `nvcc -M` query.
+                let mut rest: Vec<OsString> = Vec::new();
+                rest.extend(self.extra_args.iter().map(OsString::from));
+                rest.extend(dep_args.iter().map(OsString::from));
                 if let Some(ccbin) = &ccbin_env {
-                    command
-                        .arg("-allow-unsupported-compiler")
-                        .args(["-ccbin", ccbin]);
+                    rest.push("-allow-unsupported-compiler".into());
+                    rest.push("-ccbin".into());
+                    rest.push(ccbin.into());
                 }
 
                 // Add nvcc threads for certain files
                 if let Some(threads) = nvcc_threads {
                     let file_path = kernel_file.to_string_lossy();
                     if self.parallel.should_use_nvcc_threads(&file_path) {
-                        command.arg(format!("--threads={}", threads));
+                        rest.push(format!("--threads={}", threads).into());
                     }
                 }
+
+                let mut dep_query: Vec<OsString> = vec![
+                    gencode_arg.clone().into(),
+                    "--default-stream".into(),
+                    "per-thread".into(),
+                ];
+                dep_query.extend(rest.iter().cloned());
+                let closure =
+                    match deps::nvcc_closure(&toolkit.nvcc_path, &dep_query, kernel_file) {
+                        Ok(paths) => deps::hash_closure(&paths, &memo).unwrap_or_default(),
+                        Err(e) => {
+                            println!(
+                                "cargo:warning={}: no dependency closure ({e}); it will be rebuilt every time",
+                                kernel_file.display()
+                            );
+                            Vec::new()
+                        }
+                    };
+                compiled_deps
+                    .lock()
+                    .unwrap()
+                    .insert(kernel_file.to_path_buf(), closure);
+
+                let mut command = Command::new(&toolkit.nvcc_path);
+                command
+                    .arg(&gencode_arg)
+                    .arg("--ptx")
+                    .args(["--default-stream", "per-thread"])
+                    .args(["--output-directory", &self.out_dir.to_string_lossy()])
+                    .args(&rest);
 
                 command.arg(kernel_file);
 
@@ -709,6 +784,12 @@ impl KernelBuilder {
             },
         )?;
 
+        let mut compiled_deps = compiled_deps.into_inner().unwrap();
+        for d in compiled_deps.values() {
+            closures.extend_from_slice(d);
+        }
+        deps::emit_rerun_if_changed(closures.iter().map(|d| d.path.as_str()), &excluded);
+
         // Update cache for PTX files
         if self.incremental {
             for kernel_file in &kernel_files {
@@ -721,12 +802,21 @@ impl KernelBuilder {
                     .out_dir
                     .join(kernel_file.with_extension("ptx").file_name().unwrap());
 
-                cache.update(
+                // Files compiled now get their new closure; the others keep theirs.
+                let file_deps = match compiled_deps.remove(kernel_file) {
+                    Some(d) => d,
+                    None => cache
+                        .deps_of(kernel_file, &output_file)
+                        .map(<[DepHash]>::to_vec)
+                        .unwrap_or_default(),
+                };
+                cache.update_with_deps(
                     kernel_file,
                     &output_file,
                     &gpu_arch.to_nvcc_arch(),
                     &args_hash,
                     &watch_hash,
+                    file_deps,
                 )?;
             }
             cache.save(&self.out_dir)?;
@@ -808,12 +898,6 @@ impl NvccCrtArgs {
             args.push(host_crt.to_string());
         }
         args
-    }
-
-    fn add_to_command(&self, command: &mut Command) {
-        if let Some(host_crt) = self.host_crt {
-            command.arg("-Xcompiler").arg(host_crt);
-        }
     }
 }
 
