@@ -49,13 +49,23 @@ pub(crate) fn nvcc_closure(
     Ok(deps)
 }
 
-/// Content hashes of `deps`, `None` if any of them cannot be read.
-pub(crate) fn hash_closure(deps: &[PathBuf], memo: &HashMemo) -> Option<Vec<DepHash>> {
+/// Content hashes of `deps`. Fails, naming the file, if one cannot be read or its path is not
+/// UTF-8; the object then has no recorded closure and is rebuilt every time.
+pub(crate) fn hash_closure(
+    deps: &[PathBuf],
+    memo: &HashMemo,
+) -> std::result::Result<Vec<DepHash>, String> {
     deps.iter()
         .map(|p| {
-            Some(DepHash {
-                path: p.to_str()?.to_string(),
-                hash: memo.hash(p)?,
+            let path = p
+                .to_str()
+                .ok_or_else(|| format!("dependency path is not UTF-8: {}", p.display()))?;
+            let hash = memo
+                .hash(p)
+                .ok_or_else(|| format!("cannot read dependency {}", p.display()))?;
+            Ok(DepHash {
+                path: path.to_string(),
+                hash,
             })
         })
         .collect()
@@ -131,15 +141,40 @@ fn absolute(path: &Path) -> PathBuf {
     std::fs::canonicalize(&path).unwrap_or(path)
 }
 
+/// A path in `OUT_DIR` that never exists. When some compile's closure could not be determined,
+/// the build script declares it as an input, so cargo reruns the script on every build: a
+/// header-only edit can then never be missed, even though that object's headers are unknown.
+pub(crate) const CLOSURE_MISSING: &str = ".cudaforge-closure-missing";
+
 /// Print `cargo:rerun-if-changed` for every file of the closures that exists and is not under
-/// one of `excluded`, once each.
+/// one of `excluded`, once each, plus the [`CLOSURE_MISSING`] sentinel in `closure_missing_in`
+/// when a closure is missing.
 pub(crate) fn emit_rerun_if_changed<'a>(
     deps: impl IntoIterator<Item = &'a str>,
     excluded: &[PathBuf],
+    closure_missing_in: Option<&Path>,
 ) {
-    for path in rerun_inputs(deps, excluded) {
-        println!("cargo:rerun-if-changed={path}");
+    for line in rerun_lines(deps, excluded, closure_missing_in) {
+        println!("{line}");
     }
+}
+
+fn rerun_lines<'a>(
+    deps: impl IntoIterator<Item = &'a str>,
+    excluded: &[PathBuf],
+    closure_missing_in: Option<&Path>,
+) -> Vec<String> {
+    let mut lines: Vec<String> = rerun_inputs(deps, excluded)
+        .into_iter()
+        .map(|p| format!("cargo:rerun-if-changed={p}"))
+        .collect();
+    if let Some(dir) = closure_missing_in {
+        lines.push(format!(
+            "cargo:rerun-if-changed={}",
+            dir.join(CLOSURE_MISSING).display()
+        ));
+    }
+    lines
 }
 
 fn rerun_inputs<'a>(deps: impl IntoIterator<Item = &'a str>, excluded: &[PathBuf]) -> Vec<String> {
@@ -181,6 +216,38 @@ mod tests {
             ]
         );
         assert!(parse_make_deps("").is_empty());
+    }
+
+    #[test]
+    fn a_missing_closure_makes_the_build_script_rerun_every_time() {
+        let out = std::env::temp_dir().join(format!("cudaforge-sentinel-{}", std::process::id()));
+        let none = rerun_lines(std::iter::empty(), &[], None);
+        assert!(none.is_empty());
+        let lines = rerun_lines(std::iter::empty(), &[], Some(&out));
+        assert_eq!(
+            lines,
+            [format!(
+                "cargo:rerun-if-changed={}",
+                out.join(CLOSURE_MISSING).display()
+            )]
+        );
+        // The sentinel never exists, so cargo always considers the input changed.
+        assert!(!out.join(CLOSURE_MISSING).exists());
+    }
+
+    #[test]
+    fn unreadable_dependency_is_reported_by_name() {
+        let root =
+            std::env::temp_dir().join(format!("cudaforge-unreadable-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.cuh"), "x").unwrap();
+        let memo = HashMemo::default();
+        let ok = hash_closure(&[root.join("a.cuh")], &memo).unwrap();
+        assert_eq!(ok.len(), 1);
+        let err = hash_closure(&[root.join("a.cuh"), root.join("gone.cuh")], &memo).unwrap_err();
+        assert!(err.contains("gone.cuh"), "{err}");
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
