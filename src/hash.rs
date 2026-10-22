@@ -7,10 +7,45 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::SystemTime;
 // redundant walkdir import removed
 
 const CACHE_FILENAME: &str = ".cudaforge_cache.json";
+
+/// Cache format version. Version 2 records each object's dependency closure; caches written by
+/// version 1 (which only hashed the `.cu` file, so header edits went unnoticed) are discarded.
+const CACHE_VERSION: u32 = 2;
+
+/// One file of an object's dependency closure, as `nvcc -M` reported it, with its content hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DepHash {
+    /// The path as nvcc reported it (relative paths are relative to the build script's directory).
+    pub path: String,
+    /// SHA-256 of the file content.
+    pub hash: String,
+}
+
+/// Content hashes of files, computed at most once per build-script run.
+#[derive(Debug, Default)]
+pub struct HashMemo {
+    hashes: Mutex<HashMap<PathBuf, Option<String>>>,
+}
+
+impl HashMemo {
+    /// The SHA-256 of `path`'s content, `None` if it cannot be read.
+    pub fn hash(&self, path: &Path) -> Option<String> {
+        if let Some(h) = self.hashes.lock().unwrap().get(path) {
+            return h.clone();
+        }
+        let h = hash_file(path).ok();
+        self.hashes
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), h.clone());
+        h
+    }
+}
 
 /// Build cache for tracking file modifications
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,13 +72,17 @@ pub struct CacheEntry {
     pub gpu_arch: String,
     /// Extra args used (hash of args)
     pub args_hash: String,
+    /// Every file the compile read (`nvcc -M` with the compile's own arguments), with its
+    /// content hash. Empty means unknown, which always rebuilds.
+    #[serde(default)]
+    pub deps: Vec<DepHash>,
 }
 
 impl Default for BuildCache {
     fn default() -> Self {
         Self {
             entries: HashMap::new(),
-            version: 1,
+            version: CACHE_VERSION,
         }
     }
 }
@@ -56,7 +95,9 @@ impl BuildCache {
         if cache_path.exists() {
             if let Ok(contents) = fs::read_to_string(&cache_path) {
                 if let Ok(cache) = serde_json::from_str::<BuildCache>(&contents) {
-                    return cache;
+                    if cache.version == CACHE_VERSION {
+                        return cache;
+                    }
                 }
             }
         }
@@ -84,6 +125,28 @@ impl BuildCache {
         gpu_arch: &str,
         args_hash: &str,
         watch_hash: &str,
+    ) -> bool {
+        self.needs_rebuild_memo(
+            source_path,
+            object_path,
+            gpu_arch,
+            args_hash,
+            watch_hash,
+            &HashMemo::default(),
+        )
+    }
+
+    /// [`needs_rebuild`](Self::needs_rebuild), hashing files through `memo`. Besides the source,
+    /// arguments, architecture and watched paths, every file of the recorded dependency closure
+    /// must still have the content it was compiled with.
+    pub fn needs_rebuild_memo(
+        &self,
+        source_path: &Path,
+        object_path: &Path,
+        gpu_arch: &str,
+        args_hash: &str,
+        watch_hash: &str,
+        memo: &HashMemo,
     ) -> bool {
         let key = format!("{}:{}", source_path.display(), object_path.display());
 
@@ -120,10 +183,27 @@ impl BuildCache {
             return true;
         }
 
-        false
+        // Check every header and source the compile read
+        if entry.deps.is_empty() {
+            return true;
+        }
+        entry
+            .deps
+            .iter()
+            .any(|dep| memo.hash(Path::new(&dep.path)).as_deref() != Some(dep.hash.as_str()))
     }
 
-    /// Update cache entry for a compiled file
+    /// The recorded dependency closure of an object, if any.
+    pub fn deps_of(&self, source_path: &Path, object_path: &Path) -> Option<&[DepHash]> {
+        let key = format!("{}:{}", source_path.display(), object_path.display());
+        self.entries
+            .get(&key)
+            .map(|e| e.deps.as_slice())
+            .filter(|d| !d.is_empty())
+    }
+
+    /// Update cache entry for a compiled file, without a dependency closure (the entry is then
+    /// always rebuilt; see [`update_with_deps`](Self::update_with_deps)).
     pub fn update(
         &mut self,
         source_path: &Path,
@@ -131,6 +211,26 @@ impl BuildCache {
         gpu_arch: &str,
         args_hash: &str,
         watch_hash: &str,
+    ) -> Result<()> {
+        self.update_with_deps(
+            source_path,
+            object_path,
+            gpu_arch,
+            args_hash,
+            watch_hash,
+            Vec::new(),
+        )
+    }
+
+    /// Update cache entry for a compiled file, recording the files it was compiled from.
+    pub fn update_with_deps(
+        &mut self,
+        source_path: &Path,
+        object_path: &Path,
+        gpu_arch: &str,
+        args_hash: &str,
+        watch_hash: &str,
+        deps: Vec<DepHash>,
     ) -> Result<()> {
         let key = format!("{}:{}", source_path.display(), object_path.display());
         let content_hash = hash_file(source_path)?;
@@ -154,6 +254,7 @@ impl BuildCache {
                 object_path: object_path.to_string_lossy().to_string(),
                 gpu_arch: gpu_arch.to_string(),
                 args_hash: args_hash.to_string(),
+                deps,
             },
         );
 
