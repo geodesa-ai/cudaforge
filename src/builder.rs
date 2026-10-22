@@ -447,7 +447,7 @@ impl KernelBuilder {
         }
 
         if compile_jobs.is_empty() && out_file.exists() {
-            deps::emit_rerun_if_changed(closures.iter().map(|d| d.path.as_str()), &excluded);
+            deps::emit_rerun_if_changed(closures.iter().map(|d| d.path.as_str()), &excluded, None);
             println!("cargo:warning=All library kernels up-to-date, skipping compilation");
             return Ok(());
         }
@@ -463,6 +463,8 @@ impl KernelBuilder {
         // Compile in parallel
         let had_error = AtomicBool::new(false);
         let compiled_deps: Mutex<HashMap<PathBuf, Vec<DepHash>>> = Mutex::new(HashMap::new());
+        // Set when some compile's dependency closure could not be determined (see deps::CLOSURE_MISSING).
+        let closure_missing = AtomicBool::new(false);
 
         compile_jobs.par_iter().try_for_each(
             |(kernel_file, obj_file, gpu_arch)| -> Result<()> {
@@ -519,13 +521,16 @@ impl KernelBuilder {
                 let mut dep_query: Vec<OsString> = vec![gencode_arg.clone().into()];
                 dep_query.extend(rest.iter().cloned());
                 let closure =
-                    match deps::nvcc_closure(&toolkit.nvcc_path, &dep_query, kernel_file) {
-                        Ok(paths) => deps::hash_closure(&paths, &memo).unwrap_or_default(),
+                    match deps::nvcc_closure(&toolkit.nvcc_path, &dep_query, kernel_file)
+                        .and_then(|paths| deps::hash_closure(&paths, &memo))
+                    {
+                        Ok(closure) => closure,
                         Err(e) => {
                             println!(
                                 "cargo:warning={}: no dependency closure ({e}); it will be rebuilt every time",
                                 kernel_file.display()
                             );
+                            closure_missing.store(true, Ordering::Relaxed);
                             Vec::new()
                         }
                     };
@@ -573,7 +578,13 @@ impl KernelBuilder {
         for d in compiled_deps.values() {
             closures.extend_from_slice(d);
         }
-        deps::emit_rerun_if_changed(closures.iter().map(|d| d.path.as_str()), &excluded);
+        deps::emit_rerun_if_changed(
+            closures.iter().map(|d| d.path.as_str()),
+            &excluded,
+            closure_missing
+                .load(Ordering::Relaxed)
+                .then_some(self.out_dir.as_path()),
+        );
 
         // Update cache for compiled files
         if self.incremental {
@@ -690,7 +701,7 @@ impl KernelBuilder {
         }
 
         if compile_jobs.is_empty() {
-            deps::emit_rerun_if_changed(closures.iter().map(|d| d.path.as_str()), &excluded);
+            deps::emit_rerun_if_changed(closures.iter().map(|d| d.path.as_str()), &excluded, None);
             println!("cargo:warning=All PTX kernels up-to-date, skipping compilation");
             return Ok(PtxOutput {
                 paths: kernel_files,
@@ -706,6 +717,8 @@ impl KernelBuilder {
 
         // Compile in parallel
         let compiled_deps: Mutex<HashMap<PathBuf, Vec<DepHash>>> = Mutex::new(HashMap::new());
+        // Set when some compile's dependency closure could not be determined (see deps::CLOSURE_MISSING).
+        let closure_missing = AtomicBool::new(false);
         compile_jobs.par_iter().try_for_each(
             |(kernel_file, _output_file, gpu_arch)| -> Result<()> {
                 let gencode_arg = gpu_arch.to_gencode_arg();
@@ -735,13 +748,16 @@ impl KernelBuilder {
                 ];
                 dep_query.extend(rest.iter().cloned());
                 let closure =
-                    match deps::nvcc_closure(&toolkit.nvcc_path, &dep_query, kernel_file) {
-                        Ok(paths) => deps::hash_closure(&paths, &memo).unwrap_or_default(),
+                    match deps::nvcc_closure(&toolkit.nvcc_path, &dep_query, kernel_file)
+                        .and_then(|paths| deps::hash_closure(&paths, &memo))
+                    {
+                        Ok(closure) => closure,
                         Err(e) => {
                             println!(
                                 "cargo:warning={}: no dependency closure ({e}); it will be rebuilt every time",
                                 kernel_file.display()
                             );
+                            closure_missing.store(true, Ordering::Relaxed);
                             Vec::new()
                         }
                     };
@@ -788,7 +804,13 @@ impl KernelBuilder {
         for d in compiled_deps.values() {
             closures.extend_from_slice(d);
         }
-        deps::emit_rerun_if_changed(closures.iter().map(|d| d.path.as_str()), &excluded);
+        deps::emit_rerun_if_changed(
+            closures.iter().map(|d| d.path.as_str()),
+            &excluded,
+            closure_missing
+                .load(Ordering::Relaxed)
+                .then_some(self.out_dir.as_path()),
+        );
 
         // Update cache for PTX files
         if self.incremental {
