@@ -10,6 +10,54 @@ use std::process::Command;
 const ANSI_RED_BOLD: &str = "\x1b[1;31m";
 const ANSI_RESET: &str = "\x1b[0m";
 
+/// Environment variables that make git operate on a repository other than the one in its working
+/// directory. `git bisect run` in a linked worktree exports `GIT_DIR` to its command, git hooks and
+/// aliases export several of these, and cargo passes them to build scripts; any of them would point
+/// a dependency's git calls at the enclosing repository.
+const INHERITED_GIT_REPO_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_PREFIX",
+];
+
+/// A `git` command with every inherited repository-locating variable removed (for `clone`, which
+/// creates its own repository).
+fn git_command() -> Command {
+    let mut cmd = Command::new("git");
+    for var in INHERITED_GIT_REPO_ENV {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+/// A `git` command pinned to the clone at `dir`: explicit `GIT_DIR`/`GIT_WORK_TREE` and `-C`, so it can
+/// never act on an enclosing repository, whatever the inherited environment or `dir`'s parents are.
+/// Callers must first check that `dir` holds a clone ([`is_clone`]).
+fn git_in(dir: &Path) -> Command {
+    // Absolute, so `GIT_DIR`/`GIT_WORK_TREE` mean the same after `-C` changes directory.
+    let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let dir = dir.as_path();
+    let mut cmd = git_command();
+    cmd.arg("-C")
+        .arg(dir)
+        .env("GIT_DIR", dir.join(".git"))
+        .env("GIT_WORK_TREE", dir)
+        .current_dir(dir);
+    cmd
+}
+
+/// Whether `dir` is a clone of its own (an interrupted clone can leave the directory without `.git`).
+fn is_clone(dir: &Path) -> bool {
+    dir.join(".git").join("HEAD").is_file()
+}
+
 /// Well-known CUTLASS repository configuration
 const CUTLASS_REPO: &str = "https://github.com/NVIDIA/cutlass.git";
 const CUTLASS_DEFAULT_COMMIT: &str = "7127592069c2fe01b041e174ba4345ef9b279671";
@@ -118,6 +166,23 @@ impl ExternalDependency {
 
     /// Internal fetch logic, called while holding the lock
     fn fetch_with_lock(&self, dep_dir: &PathBuf) -> Result<PathBuf> {
+        // A directory without its own `.git` (an interrupted clone) must not be used: git commands run
+        // in it would discover an enclosing repository. Remove it and clone again.
+        if dep_dir.exists() && !is_clone(dep_dir) {
+            println!(
+                "cargo:warning=Removing incomplete {} checkout at {} (no .git)",
+                self.name,
+                dep_dir.display()
+            );
+            std::fs::remove_dir_all(dep_dir).map_err(|e| {
+                Error::GitOperationFailed(format!(
+                    "Failed to remove incomplete checkout {}: {}",
+                    dep_dir.display(),
+                    e
+                ))
+            })?;
+        }
+
         // Check if already at correct commit
         if dep_dir.join("include").exists() {
             if let Ok(current_commit) = self.get_current_commit(dep_dir) {
@@ -170,12 +235,19 @@ impl ExternalDependency {
         args
     }
 
-    fn get_current_commit(&self, dir: &PathBuf) -> Result<String> {
-        let output = Command::new("git")
+    fn get_current_commit(&self, dir: &Path) -> Result<String> {
+        let output = git_in(dir)
             .args(["rev-parse", "HEAD"])
-            .current_dir(dir)
             .output()
             .map_err(|e| git_command_error("rev-parse", e))?;
+
+        if !output.status.success() {
+            return Err(Error::GitOperationFailed(format!(
+                "git rev-parse HEAD failed in {} with status: {}",
+                dir.display(),
+                output.status
+            )));
+        }
 
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
@@ -187,7 +259,7 @@ impl ExternalDependency {
             .to_str()
             .ok_or_else(|| Error::GitOperationFailed("Invalid path encoding".to_string()))?;
 
-        let mut cmd = Command::new("git");
+        let mut cmd = git_command();
         cmd.args(["clone", "--depth", "1", "--filter=blob:none", "--sparse"]);
         if !self.recurse_submodules {
             cmd.arg("--no-recurse-submodules");
@@ -204,20 +276,25 @@ impl ExternalDependency {
                 status
             )));
         }
+        if !is_clone(target_dir) {
+            return Err(Error::GitOperationFailed(format!(
+                "git clone reported success but {} has no .git",
+                target_dir.display()
+            )));
+        }
 
         Ok(())
     }
 
-    fn setup_sparse_checkout(&self, dir: &PathBuf) -> Result<()> {
+    fn setup_sparse_checkout(&self, dir: &Path) -> Result<()> {
         // Set sparse checkout paths
         let mut args = vec!["sparse-checkout", "set"];
         for path in self.sparse_paths() {
             args.push(path);
         }
 
-        let status = Command::new("git")
+        let status = git_in(dir)
             .args(&args)
-            .current_dir(dir)
             .status()
             .map_err(|e| git_command_error("sparse-checkout", e))?;
 
@@ -231,7 +308,7 @@ impl ExternalDependency {
         Ok(())
     }
 
-    fn checkout_commit(&self, dir: &PathBuf) -> Result<()> {
+    fn checkout_commit(&self, dir: &Path) -> Result<()> {
         // Clean up any stale git lock files that may have been left by interrupted operations
         self.cleanup_git_locks(dir);
 
@@ -241,14 +318,13 @@ impl ExternalDependency {
         );
 
         // Fetch the specific commit
-        let mut cmd = Command::new("git");
+        let mut cmd = git_in(dir);
         cmd.arg("fetch");
         if !self.recurse_submodules {
             cmd.arg("--no-recurse-submodules");
         }
         let status = cmd
             .args(["origin", &self.commit])
-            .current_dir(dir)
             .status()
             .map_err(|e| git_command_error("fetch", e))?;
 
@@ -260,9 +336,8 @@ impl ExternalDependency {
         }
 
         // Checkout the commit
-        let status = Command::new("git")
+        let status = git_in(dir)
             .args(["checkout", &self.commit])
-            .current_dir(dir)
             .status()
             .map_err(|e| git_command_error("checkout", e))?;
 
